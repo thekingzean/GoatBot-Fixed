@@ -36,3 +36,35 @@ function startProject() {
 }
 
 startProject();
+const express = require('express');
+const app = express();
+
+app.get('/', (req, res) => {
+  res.send('GoatBot is running on Render!');
+});
+
+const PORT = process.env.PORT || 3000;
+app.listen(PORT, () => {
+  console.log(`GoatBot server is running on port ${PORT}`);
+});
+
+// GoatBot start code
+const { spawn } = require("child_process");
+const log = require("./logger/log.js");
+
+function startProject() {
+  const child = spawn("node", ["Goat.js"], {
+    cwd: __dirname,
+    stdio: "inherit",
+    shell: true
+  });
+
+  child.on("close", (code) => {
+    if (code === 2) {
+      log.info("Restarting Project...");
+      startProject();
+    }
+  });
+}
+
+startProject();
