@@ -1,3 +1,5 @@
+//Modified by NEXXO ☠️
+
 "use strict";
 
 const utils = require("./utils");
