@@ -1,4 +1,5 @@
-//Modified by NEXXO ☠️
+// Modified by NEXXO ☠️
+// Anti-Ban features added: User-Agent rotation, request delays, retry with backoff, proxy validation, presence throttle.
 
 "use strict";
 
@@ -13,6 +14,16 @@ log.maxRecordSize = defaultLogRecordSize;
 
 function delay(ms) {
   return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+const userAgents = [
+  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/114.0.0.0 Safari/537.36",
+  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/15.1 Safari/605.1.15",
+  "Mozilla/5.0 (Linux; Android 12; SM-G991B) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/102.0.5005.99 Mobile Safari/537.36"
+];
+
+function getRandomUserAgent() {
+  return userAgents[Math.floor(Math.random() * userAgents.length)];
 }
 
 function setOptions(globalOptions, options) {
@@ -48,7 +59,9 @@ function setOptions(globalOptions, options) {
         globalOptions.forceLogin = Boolean(options.forceLogin);
         break;
       case 'userAgent':
-        globalOptions.userAgent = options.userAgent;
+        if (typeof options.userAgent === "string" && options.userAgent.length > 10) {
+          globalOptions.userAgent = options.userAgent;
+        }
         break;
       case 'autoMarkDelivery':
         globalOptions.autoMarkDelivery = Boolean(options.autoMarkDelivery);
@@ -60,9 +73,11 @@ function setOptions(globalOptions, options) {
         globalOptions.listenTyping = Boolean(options.listenTyping);
         break;
       case 'proxy':
-        if (typeof options.proxy != "string") {
+        if (typeof options.proxy !== "string" || !options.proxy.match(/^https?:\/\/.+:\d+$/)) {
+          // Invalid proxy format, remove and unset
           delete globalOptions.proxy;
           utils.setProxy();
+          log.warn("setOptions", "Invalid or no proxy provided, proxy disabled");
         } else {
           globalOptions.proxy = options.proxy;
           utils.setProxy(globalOptions.proxy);
@@ -124,7 +139,9 @@ function buildAPI(globalOptions, html, jar) {
     userID, i_userID, jar, clientID, globalOptions, loggedIn: true,
     access_token: 'NONE', clientMutationId: 0, mqttClient: undefined,
     mqttEndpoint, region, fb_dtsg, wsReqNumber: 0, wsTaskNumber: 0,
-    reqCallbacks: {}, firstListen: true
+    reqCallbacks: {}, firstListen: true,
+
+    lastPresenceUpdate: 0 // For presence throttle
   };
 
   const api = {
@@ -138,42 +155,70 @@ function buildAPI(globalOptions, html, jar) {
   });
   api.listen = api.listenMqtt;
 
+  // Add presence update with throttle
+  api.updatePresenceThrottled = (presence) => {
+    const now = Date.now();
+    if (now - ctx.lastPresenceUpdate > 60000) { // max 1 update per minute
+      if (typeof api.updatePresence === 'function') {
+        api.updatePresence(presence);
+        ctx.lastPresenceUpdate = now;
+        log.info('presence', `Presence updated to: ${presence}`);
+      }
+    } else {
+      log.info('presence', 'Presence update throttled');
+    }
+  };
+
   return [ctx, defaultFuncs, api];
+}
+
+// Retry wrapper with exponential backoff for safer API calls
+async function safeApiCall(apiFunc, maxRetries = 3) {
+  for (let i = 0; i < maxRetries; i++) {
+    try {
+      return await apiFunc();
+    } catch (err) {
+      log.warn('safeApiCall', `Attempt ${i + 1} failed, retrying in ${1000 * 2 ** i}ms...`);
+      await delay(1000 * 2 ** i);
+    }
+  }
+  throw new Error("All retry attempts failed.");
 }
 
 function loginHelper(appState, email, password, globalOptions, callback, prCallback) {
   const jar = utils.getJar();
   let mainPromise;
 
-  if (appState) {
-    if (typeof appState === 'string') {
-      const arrayAppState = [];
-      appState.split(';').forEach(c => {
-        const [key, value] = c.split('=');
-        arrayAppState.push({
-          key: key.trim(),
-          value: value.trim(),
-          domain: "facebook.com",
-          path: "/",
-          expires: new Date(Date.now() + 1000 * 60 * 60 * 24 * 365 * 2)
-        });
-      });
-      appState = arrayAppState;
-    }
-
-    appState.forEach(c => {
-      const str = `${c.key}=${c.value}; domain=${c.domain}; path=${c.path}; expires=${new Date(c.expires).toUTCString()}`;
-      jar.setCookie(str, `https://${c.domain}`);
-    });
-
-    mainPromise = utils.get('https://www.facebook.com/', jar, null, globalOptions, { noRef: true })
-      .then(async res => {
-        await delay(1500);
-        return utils.saveCookies(jar)(res);
-      });
-  } else {
-    throw { error: "No appState provided. Email/password login is unsupported." };
+  if (!appState) {
+    throw { error: "No appState provided. Email/password login is unsupported to prevent ban." };
   }
+
+  // Accept appState as string or array
+  if (typeof appState === 'string') {
+    const arrayAppState = [];
+    appState.split(';').forEach(c => {
+      const [key, value] = c.split('=');
+      arrayAppState.push({
+        key: key.trim(),
+        value: value.trim(),
+        domain: "facebook.com",
+        path: "/",
+        expires: new Date(Date.now() + 1000 * 60 * 60 * 24 * 365 * 2)
+      });
+    });
+    appState = arrayAppState;
+  }
+
+  appState.forEach(c => {
+    const str = `${c.key}=${c.value}; domain=${c.domain}; path=${c.path}; expires=${new Date(c.expires).toUTCString()}`;
+    jar.setCookie(str, `https://${c.domain}`);
+  });
+
+  mainPromise = utils.get('https://www.facebook.com/', jar, null, globalOptions, { noRef: true })
+    .then(async res => {
+      await delay(1500); // Delay to reduce request spam
+      return utils.saveCookies(jar)(res);
+    });
 
   let ctx, _defaultFuncs, api;
 
@@ -214,7 +259,7 @@ function login(loginData, options, callback) {
     logRecordSize: defaultLogRecordSize,
     online: true,
     emitReady: false,
-    userAgent: "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36"
+    userAgent: getRandomUserAgent()
   };
 
   setOptions(globalOptions, options);
@@ -232,5 +277,4 @@ function login(loginData, options, callback) {
 }
 
 module.exports = login;
-
-      
+    
