@@ -1,4 +1,4 @@
-"use strict";//modified by NEXXO ☠️
+"use strict";//modified by NEXXO 🐔
 
 const utils = require("./utils");
 const log = require("npmlog");
